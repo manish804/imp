@@ -1,0 +1,18 @@
+{
+  "name": "ai-chat-fusion-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file=.env.local server.js || node --watch server.js",
+    "start": "node server.js",
+    "test-env": "node -e \"require('dotenv').config({path: '.env.local'}); console.log('GROQ_API_KEY1:', process.env.GROQ_API_KEY1 ? 'Found' : 'Not found')\""
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "uuid": "^9.0.1"
+  }
+}
