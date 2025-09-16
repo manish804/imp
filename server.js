@@ -29,6 +29,12 @@ if (fs.existsSync(envLocalPath)) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust proxy - configure based on deployment environment
+// For Railway/Render/Heroku, use 1 to trust the first proxy
+// For development, don't trust any proxy
+const trustProxyConfig = process.env.NODE_ENV === 'production' ? 1 : false;
+app.set('trust proxy', trustProxyConfig);
+
 // Security middleware
 app.use(helmet());
 app.use(cors({
@@ -40,7 +46,17 @@ app.use(express.json());
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  // Skip rate limiting in development
+  skip: (req) => process.env.NODE_ENV === 'development',
+  message: 'Too many requests from this IP, please try again later.',
+  // Explicitly validate the trust proxy setting
+  validate: {
+    trustProxy: false, // Disable the built-in validation since we're handling it manually
+    xForwardedForHeader: false, // Disable this validation too
+  }
 });
 app.use('/api/', limiter);
 
@@ -69,6 +85,7 @@ function extractKeys(baseKeyName) {
     'OPENROUTER_API_KEY': 'OPENROUTER_API_KEY',
     'GITHUB_TOKEN': 'GITHUB_TOKEN',
     'COHERE_API_KEY': 'COHERE_API_KEY',
+    'XAI_API_KEY':'XAI_API_KEY',
   };
   
   const base = envVarMap[baseKeyName] || baseKeyName;
@@ -117,6 +134,19 @@ function authenticateSession(req, res, next) {
   next();
 }
 
+// Middleware to prevent caching of sensitive data
+function preventCache(req, res, next) {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+    'Surrogate-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY'
+  });
+  next();
+}
+
 // Initialize session - client calls this first
 app.post('/api/session/init', (req, res) => {
   const token = uuidv4();
@@ -131,7 +161,8 @@ app.post('/api/session/init', (req, res) => {
       openai: 0,
       openrouter: 0,
       github: 0,
-      cohere: 0
+      cohere: 0,
+      xai: 0
     }
   };
   
@@ -145,6 +176,7 @@ app.post('/api/session/init', (req, res) => {
   const openrouterKeys = extractKeys('OPENROUTER_API_KEY');
   const githubKeys = extractKeys('GITHUB_TOKEN');
   const cohereKeys = extractKeys('COHERE_API_KEY');
+  const xaiKeys = extractKeys('XAI_API_KEY');
   
   // Return session info with actual key counts
   res.json({
@@ -157,13 +189,14 @@ app.post('/api/session/init', (req, res) => {
       openai: openaiKeys.length,
       openrouter: openrouterKeys.length,
       github: githubKeys.length,
-      cohere: cohereKeys.length
+      cohere: cohereKeys.length,
+      xai: xaiKeys.length,
     }
   });
 });
 
 // Get API key for a specific service
-app.post('/api/keys/get', authenticateSession, (req, res) => {
+app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
   const { service } = req.body;
   
   if (!service) {
@@ -177,7 +210,9 @@ app.post('/api/keys/get', authenticateSession, (req, res) => {
     openai: 'OPENAI_API_KEY',
     openrouter: 'OPENROUTER_API_KEY',
     github: 'GITHUB_TOKEN',
-    cohere: 'COHERE_API_KEY'
+    cohere: 'COHERE_API_KEY',
+    xai:'XAI_API_KEY',
+
   };
   
   const baseKey = keyMap[service];
@@ -197,12 +232,20 @@ app.post('/api/keys/get', authenticateSession, (req, res) => {
   // Obfuscate the key for logging (show only first 10 chars)
   const obfuscatedKey = key.substring(0, 10) + '...';
   
-  res.json({
+  // Set response type to prevent browser preview
+  res.type('application/octet-stream');
+  
+  // Send the response as a buffer to prevent text preview
+  const responseData = {
     key,
     obfuscated: obfuscatedKey,
     index: currentIndex,
     total: keys.length
-  });
+  };
+  
+  // Convert to buffer and send
+  const buffer = Buffer.from(JSON.stringify(responseData));
+  res.send(buffer);
 });
 
 // Rotate to next key for a service
@@ -231,7 +274,8 @@ app.get('/api/services/status', authenticateSession, (req, res) => {
     openai: extractKeys('OPENAI_API_KEY').length > 0,
     openrouter: extractKeys('OPENROUTER_API_KEY').length > 0,
     github: extractKeys('GITHUB_TOKEN').length > 0,
-    cohere: extractKeys('COHERE_API_KEY').length > 0
+    cohere: extractKeys('COHERE_API_KEY').length > 0,
+    xai: extractKeys('XAI_API_KEY').length > 0,
   });
 });
 
@@ -244,7 +288,8 @@ app.get('/api/keys/count', authenticateSession, (req, res) => {
     openai: extractKeys('OPENAI_API_KEY').length,
     openrouter: extractKeys('OPENROUTER_API_KEY').length,
     github: extractKeys('GITHUB_TOKEN').length,
-    cohere: extractKeys('COHERE_API_KEY').length
+    cohere: extractKeys('COHERE_API_KEY').length,
+    xai: extractKeys('XAI_API_KEY').length,
   });
 });
 
@@ -264,6 +309,7 @@ app.listen(PORT, () => {
   const openrouterKeys = extractKeys('OPENROUTER_API_KEY');
   const githubKeys = extractKeys('GITHUB_TOKEN');
   const cohereKeys = extractKeys('COHERE_API_KEY');
+  const xaiKeys = extractKeys('XAI_API_KEY');
   
   console.log('- Groq:', groqKeys.length, 'keys');
   console.log('- Gemini:', geminiKeys.length, 'keys');
@@ -272,10 +318,11 @@ app.listen(PORT, () => {
   console.log('- OpenRouter:', openrouterKeys.length, 'keys');
   console.log('- GitHub:', githubKeys.length, 'keys');
   console.log('- Cohere:', cohereKeys.length, 'keys');
+  console.log('- XAI:', xaiKeys.length, 'keys');
   
   // Show total keys
   const totalKeys = groqKeys.length + geminiKeys.length + perplexityKeys.length + 
-                    openaiKeys.length + openrouterKeys.length + githubKeys.length + cohereKeys.length;
+                    openaiKeys.length + openrouterKeys.length + githubKeys.length + cohereKeys.length+xaiKeys.length;
   console.log('Total API keys configured:', totalKeys);
   
   if (totalKeys === 0) {
