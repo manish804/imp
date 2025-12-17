@@ -626,35 +626,36 @@ app.post('/api/proxy/openrouter', authenticateSession, async (req, res) => {
   res.status(503).json({ error: 'All OpenRouter models failed', success: false });
 });
 
-// Proxy endpoint for xAI API
+// Proxy endpoint for xAI (Grok) via FastRouter API
 app.post('/api/proxy/xai', authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
 
-  const keyData = getNextKey(req.session, 'xai', 'XAI_API_KEY');
-  if (!keyData) return res.status(503).json({ error: 'No xAI API keys available' });
+  // Use FastRouter API key for xAI/Grok models
+  const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available for xAI' });
 
   try {
-    const response = await fetch('https://api.x.ai/v1/chat/completions', {
+    const response = await fetch('https://api.fastrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${keyData.key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'grok-3-mini-fast-latest',
+        model: 'x-ai/grok-3-beta',
         messages: [
-          { role: 'system', content: 'You are Grok, an AI assistant by xAI.' },
+          { role: 'system', content: 'You are Grok, an AI assistant by xAI. Be helpful, witty, and insightful.' },
           { role: 'user', content: message }
         ],
-        max_tokens: 1000,
+        max_tokens: 2048,
         temperature: 0.7,
       }),
     });
 
     if (!response.ok) {
       if (response.status === 429 || response.status === 401) {
-        rotateKeyOnFailure(req.session, 'xai');
+        rotateKeyOnFailure(req.session, 'fastrouter');
       }
       return res.status(response.status).json({ error: 'xAI API error', status: response.status });
     }
@@ -662,7 +663,7 @@ app.post('/api/proxy/xai', authenticateSession, async (req, res) => {
     const data = await response.json();
     res.json({
       content: data.choices?.[0]?.message?.content || '',
-      model: 'grok-3-mini-fast-latest',
+      model: 'x-ai/grok-3-beta',
       source: 'xai',
       success: true
     });
