@@ -37,28 +37,26 @@ app.set('trust proxy', trustProxyConfig);
 
 // Security middleware
 app.use(helmet());
+
+// Define allowed origins for CORS
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://multi-ais-chat.netlify.app'
+].filter(Boolean);
+
 app.use(cors({
-
   origin: function (origin, callback) {
-
     // Allow requests with no origin (like mobile apps, curl, etc.)
-
     if (!origin) return callback(null, true);
-
     if (allowedOrigins.includes(origin)) {
-
       return callback(null, true);
-
     } else {
-
       return callback(new Error('Not allowed by CORS'), false);
-
     }
-
   },
-
   credentials: true
-
 }));
 app.use(express.json());
 
@@ -93,8 +91,16 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000); // Clean every 5 minutes
 
-// Helper to extract API keys from environment
+// Cache for extracted keys - computed once at startup
+const keyCache = new Map();
+
+// Helper to extract API keys from environment (with caching)
 function extractKeys(baseKeyName) {
+  // Return cached result if available
+  if (keyCache.has(baseKeyName)) {
+    return keyCache.get(baseKeyName);
+  }
+
   const keys = new Set();
   const envVarMap = {
     'PERPLEXITY_API_KEY': 'PERPLEXITY_API_KEY',
@@ -130,7 +136,18 @@ function extractKeys(baseKeyName) {
     console.log(`No keys found for ${baseKeyName}. Checked: ${base}, ${base}1-20, ${base}_1-20`);
   }
 
-  return Array.from(keys);
+  const result = Array.from(keys);
+  keyCache.set(baseKeyName, result);
+  return result;
+}
+
+// Pre-warm the key cache at startup
+function initializeKeyCache() {
+  const services = [
+    'GROQ_API_KEY', 'GOOGLE_API_KEY', 'PERPLEXITY_API_KEY', 'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY', 'GITHUB_TOKEN', 'COHERE_API_KEY', 'XAI_API_KEY', 'FASTROUTER_API_KEY'
+  ];
+  services.forEach(extractKeys);
 }
 
 // Middleware to verify session token
@@ -252,16 +269,13 @@ app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
   const currentIndex = req.session.keyIndices[service] || 0;
   const key = keys[currentIndex % keys.length];
 
-  // Obfuscate the key for logging (show only first 10 chars)
-  const obfuscatedKey = key.substring(0, 10) + '...';
-
-  // Set response type to prevent browser preview
+  // Set response type to prevent browser preview/caching
   res.type('application/octet-stream');
 
   // Send the response as a buffer to prevent text preview
+  // Note: Only send the key, no obfuscated version (security)
   const responseData = {
     key,
-    obfuscated: obfuscatedKey,
     index: currentIndex,
     total: keys.length
   };
@@ -323,10 +337,441 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// =============================================================================
+// SECURE PROXY ENDPOINTS - AI API calls made server-side (keys never sent to client)
+// =============================================================================
+
+// Helper to get next key with rotation
+function getNextKey(session, service, baseKeyName) {
+  const keys = extractKeys(baseKeyName);
+  if (keys.length === 0) return null;
+  const currentIndex = session.keyIndices[service] || 0;
+  return { key: keys[currentIndex % keys.length], index: currentIndex, total: keys.length };
+}
+
+// Helper to rotate key on failure
+function rotateKeyOnFailure(session, service) {
+  session.keyIndices[service] = ((session.keyIndices[service] || 0) + 1) % 1000;
+}
+
+// Proxy endpoint for Groq API
+app.post('/api/proxy/groq', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'groq', 'GROQ_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No Groq API keys available' });
+
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: 'You are Groq AI, an ultra-fast AI assistant. Provide concise, helpful responses.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'groq');
+      }
+      return res.status(response.status).json({ error: 'Groq API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: 'llama-3.1-8b-instant',
+      source: 'groq',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call Groq API', success: false });
+  }
+});
+
+// Proxy endpoint for Gemini API
+app.post('/api/proxy/gemini', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'gemini', 'GOOGLE_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No Gemini API keys available' });
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${keyData.key}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: message }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401 || response.status === 403) {
+        rotateKeyOnFailure(req.session, 'gemini');
+      }
+      return res.status(response.status).json({ error: 'Gemini API error', status: response.status });
+    }
+
+    const data = await response.json();
+    const content = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+    res.json({
+      content,
+      model: 'gemini-2.0-flash',
+      source: 'gemini',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call Gemini API', success: false });
+  }
+});
+
+// Proxy endpoint for Perplexity API
+app.post('/api/proxy/perplexity', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'perplexity', 'PERPLEXITY_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No Perplexity API keys available' });
+
+  try {
+    const response = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'sonar',
+        messages: [
+          { role: 'system', content: 'You are Perplexity AI, a research-focused assistant with web search capabilities.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 1200,
+        temperature: 0.3,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'perplexity');
+      }
+      return res.status(response.status).json({ error: 'Perplexity API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: 'sonar',
+      source: 'perplexity',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call Perplexity API', success: false });
+  }
+});
+
+// Proxy endpoint for Cohere API
+app.post('/api/proxy/cohere', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'cohere', 'COHERE_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No Cohere API keys available' });
+
+  try {
+    const response = await fetch('https://api.cohere.com/v2/chat', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'command-a-03-2025',
+        messages: [{ role: 'user', content: message }],
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'cohere');
+      }
+      return res.status(response.status).json({ error: 'Cohere API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.message?.content?.[0]?.text || '',
+      model: 'command-a-03-2025',
+      source: 'cohere',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call Cohere API', success: false });
+  }
+});
+
+// Proxy endpoint for GitHub Models API
+app.post('/api/proxy/github', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'github', 'GITHUB_TOKEN');
+  if (!keyData) return res.status(503).json({ error: 'No GitHub API tokens available' });
+
+  const models = ['xai/grok-3-mini', 'deepseek/DeepSeek-V3-0324', 'openai/gpt-4.1'];
+  const selectedModel = models[Math.floor(Date.now() / 1000) % models.length];
+
+  try {
+    const response = await fetch('https://models.github.ai/inference/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: [
+          { role: 'system', content: 'You are GitHub AI, an advanced AI assistant.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'github');
+      }
+      return res.status(response.status).json({ error: 'GitHub API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: selectedModel,
+      source: 'github',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call GitHub API', success: false });
+  }
+});
+
+// Proxy endpoint for OpenRouter API
+app.post('/api/proxy/openrouter', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'openrouter', 'OPENROUTER_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No OpenRouter API keys available' });
+
+  const models = ['meta-llama/llama-3.3-70b-instruct:free', 'mistralai/mistral-7b-instruct:free'];
+
+  for (const model of models) {
+    try {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${keyData.key}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': process.env.FRONTEND_URL || 'http://localhost:5173',
+          'X-Title': 'AI Chat Fusion',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: 'You are OpenRouter AI, a flexible AI assistant.' },
+            { role: 'user', content: message }
+          ],
+          max_tokens: 1000,
+          temperature: 0.5,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return res.json({
+          content: data.choices?.[0]?.message?.content || '',
+          model,
+          source: 'openrouter',
+          success: true
+        });
+      }
+
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'openrouter');
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+
+  res.status(503).json({ error: 'All OpenRouter models failed', success: false });
+});
+
+// Proxy endpoint for xAI API
+app.post('/api/proxy/xai', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'xai', 'XAI_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No xAI API keys available' });
+
+  try {
+    const response = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'grok-3-mini-fast-latest',
+        messages: [
+          { role: 'system', content: 'You are Grok, an AI assistant by xAI.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'xai');
+      }
+      return res.status(response.status).json({ error: 'xAI API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: 'grok-3-mini-fast-latest',
+      source: 'xai',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call xAI API', success: false });
+  }
+});
+
+// Proxy endpoint for OpenAI API
+app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'openai', 'OPENAI_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No OpenAI API keys available' });
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are a helpful AI assistant.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'openai');
+      }
+      return res.status(response.status).json({ error: 'OpenAI API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: 'gpt-4o-mini',
+      source: 'openai',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call OpenAI API', success: false });
+  }
+});
+
+// Proxy endpoint for FastRouter (Anthropic Claude) API
+app.post('/api/proxy/fastrouter', authenticateSession, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available' });
+
+  const models = ['anthropic/claude-sonnet-4-20250514', 'anthropic/claude-3-5-sonnet-20241022'];
+  const selectedModel = models[Math.floor(Date.now() / 1000) % models.length];
+
+  try {
+    const response = await fetch('https://api.fastrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: [
+          { role: 'system', content: 'You are Claude, an AI assistant by Anthropic. Be helpful and honest.' },
+          { role: 'user', content: message }
+        ],
+        max_tokens: 2048,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'fastrouter');
+      }
+      return res.status(response.status).json({ error: 'FastRouter API error', status: response.status });
+    }
+
+    const data = await response.json();
+    res.json({
+      content: data.choices?.[0]?.message?.content || '',
+      model: selectedModel,
+      source: 'fastrouter',
+      success: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to call FastRouter API', success: false });
+  }
+});
+
+// Initialize key cache before starting server
+initializeKeyCache();
+
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
   console.log('Configured services:');
 
+  // Keys are now cached, these calls are O(1)
   const groqKeys = extractKeys('GROQ_API_KEY');
   const geminiKeys = extractKeys('GOOGLE_API_KEY');
   const perplexityKeys = extractKeys('PERPLEXITY_API_KEY');
