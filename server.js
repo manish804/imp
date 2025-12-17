@@ -659,7 +659,7 @@ app.post('/api/proxy/xai', authenticateSession, async (req, res) => {
   if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available for xAI' });
 
   try {
-    const response = await fetch('https://api.fastrouter.ai/api/v1/chat/completions', {
+    const response = await fetch('https://go.fastrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${keyData.key}`,
@@ -756,7 +756,7 @@ app.post('/api/proxy/fastrouter', authenticateSession, async (req, res) => {
   const selectedModel = models[Math.floor(Date.now() / 1000) % models.length];
 
   try {
-    const response = await fetch('https://api.fastrouter.ai/api/v1/chat/completions', {
+    const response = await fetch('https://go.fastrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${keyData.key}`,
