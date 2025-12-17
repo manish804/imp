@@ -37,27 +37,28 @@ app.set('trust proxy', trustProxyConfig);
 
 // Security middleware
 app.use(helmet());
-// app.use(cors({
-//   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-//   credentials: true
-// }));
-// Parse FRONTEND_URL(s) - support comma-separated list
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
-  .split(',')
-  .map(origin => origin.trim());
-
-// Configure CORS with dynamic origin check
 app.use(cors({
+
   origin: function (origin, callback) {
+
     // Allow requests with no origin (like mobile apps, curl, etc.)
+
     if (!origin) return callback(null, true);
+
     if (allowedOrigins.includes(origin)) {
+
       return callback(null, true);
+
     } else {
+
       return callback(new Error('Not allowed by CORS'), false);
+
     }
+
   },
+
   credentials: true
+
 }));
 app.use(express.json());
 
@@ -103,49 +104,50 @@ function extractKeys(baseKeyName) {
     'OPENROUTER_API_KEY': 'OPENROUTER_API_KEY',
     'GITHUB_TOKEN': 'GITHUB_TOKEN',
     'COHERE_API_KEY': 'COHERE_API_KEY',
-    'XAI_API_KEY':'XAI_API_KEY',
+    'XAI_API_KEY': 'XAI_API_KEY',
+    'FASTROUTER_API_KEY': 'FASTROUTER_API_KEY',
   };
-  
+
   const base = envVarMap[baseKeyName] || baseKeyName;
-  
+
   // Direct key
   if (process.env[base]) {
     keys.add(process.env[base]);
   }
-  
+
   // Numbered variants - check up to 20 keys per service
   for (let i = 1; i <= 20; i++) {
     // Try both KEY1 and KEY_1 formats
     const key1 = process.env[`${base}${i}`];
     const key2 = process.env[`${base}_${i}`];
-    
+
     if (key1 && key1.trim()) keys.add(key1.trim());
     if (key2 && key2.trim()) keys.add(key2.trim());
   }
-  
+
   // Debug logging for troubleshooting
   if (keys.size === 0) {
     console.log(`No keys found for ${baseKeyName}. Checked: ${base}, ${base}1-20, ${base}_1-20`);
   }
-  
+
   return Array.from(keys);
 }
 
 // Middleware to verify session token
 function authenticateSession(req, res, next) {
   const token = req.headers['x-session-token'];
-  
+
   if (!token) {
     return res.status(401).json({ error: 'No session token provided' });
   }
-  
+
   const session = sessions.get(token);
-  
+
   if (!session || Date.now() > session.expiresAt) {
     sessions.delete(token);
     return res.status(401).json({ error: 'Session expired or invalid' });
   }
-  
+
   // Refresh session
   session.expiresAt = Date.now() + SESSION_DURATION;
   req.session = session;
@@ -180,12 +182,13 @@ app.post('/api/session/init', (req, res) => {
       openrouter: 0,
       github: 0,
       cohere: 0,
-      xai: 0
+      xai: 0,
+      fastrouter: 0
     }
   };
-  
+
   sessions.set(token, session);
-  
+
   // Get actual key counts for each service
   const groqKeys = extractKeys('GROQ_API_KEY');
   const geminiKeys = extractKeys('GOOGLE_API_KEY');
@@ -195,7 +198,8 @@ app.post('/api/session/init', (req, res) => {
   const githubKeys = extractKeys('GITHUB_TOKEN');
   const cohereKeys = extractKeys('COHERE_API_KEY');
   const xaiKeys = extractKeys('XAI_API_KEY');
-  
+  const fastrouterKeys = extractKeys('FASTROUTER_API_KEY');
+
   // Return session info with actual key counts
   res.json({
     token,
@@ -209,6 +213,7 @@ app.post('/api/session/init', (req, res) => {
       github: githubKeys.length,
       cohere: cohereKeys.length,
       xai: xaiKeys.length,
+      fastrouter: fastrouterKeys.length,
     }
   });
 });
@@ -216,11 +221,11 @@ app.post('/api/session/init', (req, res) => {
 // Get API key for a specific service
 app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
   const { service } = req.body;
-  
+
   if (!service) {
     return res.status(400).json({ error: 'Service not specified' });
   }
-  
+
   const keyMap = {
     perplexity: 'PERPLEXITY_API_KEY',
     gemini: 'GOOGLE_API_KEY',
@@ -229,30 +234,30 @@ app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
     openrouter: 'OPENROUTER_API_KEY',
     github: 'GITHUB_TOKEN',
     cohere: 'COHERE_API_KEY',
-    xai:'XAI_API_KEY',
-
+    xai: 'XAI_API_KEY',
+    fastrouter: 'FASTROUTER_API_KEY',
   };
-  
+
   const baseKey = keyMap[service];
   if (!baseKey) {
     return res.status(400).json({ error: 'Invalid service' });
   }
-  
+
   const keys = extractKeys(baseKey);
   if (keys.length === 0) {
     return res.status(404).json({ error: `No keys configured for ${service}` });
   }
-  
+
   // Get current index for this service
   const currentIndex = req.session.keyIndices[service] || 0;
   const key = keys[currentIndex % keys.length];
-  
+
   // Obfuscate the key for logging (show only first 10 chars)
   const obfuscatedKey = key.substring(0, 10) + '...';
-  
+
   // Set response type to prevent browser preview
   res.type('application/octet-stream');
-  
+
   // Send the response as a buffer to prevent text preview
   const responseData = {
     key,
@@ -260,7 +265,7 @@ app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
     index: currentIndex,
     total: keys.length
   };
-  
+
   // Convert to buffer and send
   const buffer = Buffer.from(JSON.stringify(responseData));
   res.send(buffer);
@@ -269,14 +274,14 @@ app.post('/api/keys/get', authenticateSession, preventCache, (req, res) => {
 // Rotate to next key for a service
 app.post('/api/keys/rotate', authenticateSession, (req, res) => {
   const { service } = req.body;
-  
+
   if (!service || !req.session.keyIndices.hasOwnProperty(service)) {
     return res.status(400).json({ error: 'Invalid service' });
   }
-  
+
   // Increment the index
   req.session.keyIndices[service] = (req.session.keyIndices[service] + 1) % 1000;
-  
+
   res.json({
     success: true,
     newIndex: req.session.keyIndices[service]
@@ -294,6 +299,7 @@ app.get('/api/services/status', authenticateSession, (req, res) => {
     github: extractKeys('GITHUB_TOKEN').length > 0,
     cohere: extractKeys('COHERE_API_KEY').length > 0,
     xai: extractKeys('XAI_API_KEY').length > 0,
+    fastrouter: extractKeys('FASTROUTER_API_KEY').length > 0,
   });
 });
 
@@ -308,6 +314,7 @@ app.get('/api/keys/count', authenticateSession, (req, res) => {
     github: extractKeys('GITHUB_TOKEN').length,
     cohere: extractKeys('COHERE_API_KEY').length,
     xai: extractKeys('XAI_API_KEY').length,
+    fastrouter: extractKeys('FASTROUTER_API_KEY').length,
   });
 });
 
@@ -319,7 +326,7 @@ app.get('/api/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
   console.log('Configured services:');
-  
+
   const groqKeys = extractKeys('GROQ_API_KEY');
   const geminiKeys = extractKeys('GOOGLE_API_KEY');
   const perplexityKeys = extractKeys('PERPLEXITY_API_KEY');
@@ -328,7 +335,8 @@ app.listen(PORT, () => {
   const githubKeys = extractKeys('GITHUB_TOKEN');
   const cohereKeys = extractKeys('COHERE_API_KEY');
   const xaiKeys = extractKeys('XAI_API_KEY');
-  
+  const fastrouterKeys = extractKeys('FASTROUTER_API_KEY');
+
   console.log('- Groq:', groqKeys.length, 'keys');
   console.log('- Gemini:', geminiKeys.length, 'keys');
   console.log('- Perplexity:', perplexityKeys.length, 'keys');
@@ -337,12 +345,13 @@ app.listen(PORT, () => {
   console.log('- GitHub:', githubKeys.length, 'keys');
   console.log('- Cohere:', cohereKeys.length, 'keys');
   console.log('- XAI:', xaiKeys.length, 'keys');
-  
+  console.log('- FastRouter:', fastrouterKeys.length, 'keys');
+
   // Show total keys
-  const totalKeys = groqKeys.length + geminiKeys.length + perplexityKeys.length + 
-                    openaiKeys.length + openrouterKeys.length + githubKeys.length + cohereKeys.length+xaiKeys.length;
+  const totalKeys = groqKeys.length + geminiKeys.length + perplexityKeys.length +
+    openaiKeys.length + openrouterKeys.length + githubKeys.length + cohereKeys.length + xaiKeys.length + fastrouterKeys.length;
   console.log('Total API keys configured:', totalKeys);
-  
+
   if (totalKeys === 0) {
     console.warn('\n⚠️  WARNING: No API keys found!');
     console.warn('Please ensure your .env.local or .env file contains API keys.');
