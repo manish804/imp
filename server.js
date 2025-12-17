@@ -792,6 +792,61 @@ app.post('/api/proxy/fastrouter', authenticateSession, async (req, res) => {
   }
 });
 
+// Proxy endpoint for FastRouter Image Generation API
+app.post('/api/proxy/image-generate', authenticateSession, async (req, res) => {
+  const { prompt, model } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'Prompt required' });
+
+  const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available' });
+
+  // Use provided model or default to flux-schnell
+  const imageModel = model || 'black-forest-labs/flux-schnell';
+
+  try {
+    const response = await fetch('https://go.fastrouter.ai/api/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${keyData.key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: imageModel,
+        prompt: prompt,
+        n: 1,
+        size: '1024x1024'
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429 || response.status === 401) {
+        rotateKeyOnFailure(req.session, 'fastrouter');
+      }
+      const errorText = await response.text();
+      return res.status(response.status).json({
+        error: 'Image generation failed',
+        status: response.status,
+        details: errorText,
+        success: false
+      });
+    }
+
+    const data = await response.json();
+
+    // FastRouter returns data in OpenAI-compatible format
+    const imageUrl = data.data?.[0]?.url || data.data?.[0]?.b64_json;
+
+    res.json({
+      success: true,
+      imageUrl: imageUrl,
+      model: imageModel,
+      source: 'fastrouter'
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to generate image', success: false });
+  }
+});
+
 // Initialize key cache before starting server
 initializeKeyCache();
 
