@@ -354,90 +354,113 @@ function rotateKeyOnFailure(session, service) {
   session.keyIndices[service] = ((session.keyIndices[service] || 0) + 1) % 1000;
 }
 
-// Proxy endpoint for Groq API
+// Proxy endpoint for Groq API (with retry on rate limit)
 app.post('/api/proxy/groq', authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
 
-  const keyData = getNextKey(req.session, 'groq', 'GROQ_API_KEY');
-  if (!keyData) return res.status(503).json({ error: 'No Groq API keys available' });
+  const keys = extractKeys('GROQ_API_KEY');
+  const maxRetries = Math.min(keys.length, 5);
 
-  try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${keyData.key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
-        messages: [
-          { role: 'system', content: 'You are Groq AI, an ultra-fast AI assistant. Provide concise, helpful responses.' },
-          { role: 'user', content: message }
-        ],
-        max_tokens: 1000,
-        temperature: 0.7,
-      }),
-    });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const keyData = getNextKey(req.session, 'groq', 'GROQ_API_KEY');
+    if (!keyData) return res.status(503).json({ error: 'No Groq API keys available' });
 
-    if (!response.ok) {
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${keyData.key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'llama-3.1-8b-instant',
+          messages: [
+            { role: 'system', content: 'You are Groq AI, an ultra-fast AI assistant. Provide concise, helpful responses.' },
+            { role: 'user', content: message }
+          ],
+          max_tokens: 1000,
+          temperature: 0.7,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return res.json({
+          content: data.choices?.[0]?.message?.content || '',
+          model: 'llama-3.1-8b-instant',
+          source: 'groq',
+          success: true
+        });
+      }
+
       if (response.status === 429 || response.status === 401) {
         rotateKeyOnFailure(req.session, 'groq');
+        continue;
       }
-      return res.status(response.status).json({ error: 'Groq API error', status: response.status });
-    }
 
-    const data = await response.json();
-    res.json({
-      content: data.choices?.[0]?.message?.content || '',
-      model: 'llama-3.1-8b-instant',
-      source: 'groq',
-      success: true
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to call Groq API', success: false });
+      return res.status(response.status).json({ error: 'Groq API error', status: response.status });
+    } catch (error) {
+      rotateKeyOnFailure(req.session, 'groq');
+      continue;
+    }
   }
+
+  res.status(429).json({ error: 'All Groq API keys rate limited', success: false });
 });
 
-// Proxy endpoint for Gemini API
+// Proxy endpoint for Gemini API (with retry on rate limit)
 app.post('/api/proxy/gemini', authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
 
-  const keyData = getNextKey(req.session, 'gemini', 'GOOGLE_API_KEY');
-  if (!keyData) return res.status(503).json({ error: 'No Gemini API keys available' });
+  const keys = extractKeys('GOOGLE_API_KEY');
+  const maxRetries = Math.min(keys.length, 5); // Try up to 5 different keys
 
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${keyData.key}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: message }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
-        }),
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const keyData = getNextKey(req.session, 'gemini', 'GOOGLE_API_KEY');
+    if (!keyData) return res.status(503).json({ error: 'No Gemini API keys available' });
+
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${keyData.key}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: message }] }],
+            generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+          }),
+        }
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+        return res.json({
+          content,
+          model: 'gemini-2.0-flash',
+          source: 'gemini',
+          success: true
+        });
       }
-    );
 
-    if (!response.ok) {
+      // Rate limit or auth error - rotate and retry
       if (response.status === 429 || response.status === 401 || response.status === 403) {
         rotateKeyOnFailure(req.session, 'gemini');
+        continue; // Try next key
       }
-      return res.status(response.status).json({ error: 'Gemini API error', status: response.status });
-    }
 
-    const data = await response.json();
-    const content = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-    res.json({
-      content,
-      model: 'gemini-2.0-flash',
-      source: 'gemini',
-      success: true
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to call Gemini API', success: false });
+      // Other errors - return immediately
+      return res.status(response.status).json({ error: 'Gemini API error', status: response.status });
+    } catch (error) {
+      rotateKeyOnFailure(req.session, 'gemini');
+      continue; // Try next key on network errors
+    }
   }
+
+  // All retries exhausted
+  res.status(429).json({ error: 'All Gemini API keys rate limited', success: false });
 });
 
 // Proxy endpoint for Perplexity API
@@ -725,7 +748,11 @@ app.post('/api/proxy/fastrouter', authenticateSession, async (req, res) => {
   const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
   if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available' });
 
-  const models = ['anthropic/claude-sonnet-4-20250514', 'anthropic/claude-3-5-sonnet-20241022'];
+  const models = [
+    'anthropic/claude-3-7-sonnet-20250219',  // Claude 3.7 Sonnet (latest)
+    'anthropic/claude-sonnet-4-20250514',     // Claude Sonnet 4
+    'anthropic/claude-opus-4.5'               // Claude Opus 4.5 (most capable)
+  ];
   const selectedModel = models[Math.floor(Date.now() / 1000) % models.length];
 
   try {
