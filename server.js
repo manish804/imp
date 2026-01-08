@@ -409,37 +409,42 @@ app.post('/api/proxy/groq', authenticateSession, async (req, res) => {
   res.status(429).json({ error: 'All Groq API keys rate limited', success: false });
 });
 
-// Proxy endpoint for Gemini API (with retry on rate limit)
+// Proxy endpoint for Gemini API via FastRouter (with retry on rate limit)
 app.post('/api/proxy/gemini', authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
 
-  const keys = extractKeys('GOOGLE_API_KEY');
+  // Use FastRouter API key for Gemini models
+  const keys = extractKeys('FASTROUTER_API_KEY');
   const maxRetries = Math.min(keys.length, 5); // Try up to 5 different keys
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const keyData = getNextKey(req.session, 'gemini', 'GOOGLE_API_KEY');
-    if (!keyData) return res.status(503).json({ error: 'No Gemini API keys available' });
+    const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
+    if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available for Gemini' });
 
     try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${keyData.key}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: message }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
-          }),
-        }
-      );
+      const response = await fetch('https://go.fastrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${keyData.key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'google/gemini-2.5-flash',
+          messages: [
+            { role: 'system', content: 'You are Gemini, a helpful AI assistant by Google.' },
+            { role: 'user', content: message }
+          ],
+          max_tokens: 4096,
+          temperature: 0.7,
+        }),
+      });
 
       if (response.ok) {
         const data = await response.json();
-        const content = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
         return res.json({
-          content,
-          model: 'gemini-2.0-flash',
+          content: data.choices?.[0]?.message?.content || '',
+          model: 'google/gemini-2.5-flash',
           source: 'gemini',
           success: true
         });
@@ -447,20 +452,20 @@ app.post('/api/proxy/gemini', authenticateSession, async (req, res) => {
 
       // Rate limit or auth error - rotate and retry
       if (response.status === 429 || response.status === 401 || response.status === 403) {
-        rotateKeyOnFailure(req.session, 'gemini');
+        rotateKeyOnFailure(req.session, 'fastrouter');
         continue; // Try next key
       }
 
       // Other errors - return immediately
       return res.status(response.status).json({ error: 'Gemini API error', status: response.status });
     } catch (error) {
-      rotateKeyOnFailure(req.session, 'gemini');
+      rotateKeyOnFailure(req.session, 'fastrouter');
       continue; // Try next key on network errors
     }
   }
 
   // All retries exhausted
-  res.status(429).json({ error: 'All Gemini API keys rate limited', success: false });
+  res.status(429).json({ error: 'All FastRouter API keys rate limited', success: false });
 });
 
 // Proxy endpoint for Perplexity API
@@ -695,23 +700,24 @@ app.post('/api/proxy/xai', authenticateSession, async (req, res) => {
   }
 });
 
-// Proxy endpoint for OpenAI API
+// Proxy endpoint for OpenAI API via FastRouter
 app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
 
-  const keyData = getNextKey(req.session, 'openai', 'OPENAI_API_KEY');
-  if (!keyData) return res.status(503).json({ error: 'No OpenAI API keys available' });
+  // Use FastRouter API key for OpenAI models
+  const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
+  if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available for OpenAI' });
 
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://go.fastrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${keyData.key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'openai/gpt-4.1',
         messages: [
           { role: 'system', content: 'You are a helpful AI assistant.' },
           { role: 'user', content: message }
@@ -723,7 +729,7 @@ app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
 
     if (!response.ok) {
       if (response.status === 429 || response.status === 401) {
-        rotateKeyOnFailure(req.session, 'openai');
+        rotateKeyOnFailure(req.session, 'fastrouter');
       }
       return res.status(response.status).json({ error: 'OpenAI API error', status: response.status });
     }
@@ -731,7 +737,7 @@ app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
     const data = await response.json();
     res.json({
       content: data.choices?.[0]?.message?.content || '',
-      model: 'gpt-4o-mini',
+      model: 'openai/gpt-4.1',
       source: 'openai',
       success: true
     });
