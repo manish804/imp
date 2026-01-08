@@ -42,7 +42,7 @@ app.use(helmet());
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
   'http://localhost:5173',
-  'http://localhost:3000',
+  'https://aifiestaa.netlify.app',
   'https://multi-ais-chat.netlify.app'
 ].filter(Boolean);
 
