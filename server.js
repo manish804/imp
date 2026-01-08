@@ -42,7 +42,7 @@ app.use(helmet());
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
   'http://localhost:5173',
-  'https://aifiestaa.netlify.app',
+  'http://localhost:3000',
   'https://multi-ais-chat.netlify.app'
 ].filter(Boolean);
 
@@ -717,7 +717,7 @@ app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'openai/gpt-4.1',
+        model: 'openai/gpt-4o',
         messages: [
           { role: 'system', content: 'You are a helpful AI assistant.' },
           { role: 'user', content: message }
@@ -737,7 +737,7 @@ app.post('/api/proxy/openai', authenticateSession, async (req, res) => {
     const data = await response.json();
     res.json({
       content: data.choices?.[0]?.message?.content || '',
-      model: 'openai/gpt-4.1',
+      model: 'openai/gpt-4o',
       source: 'openai',
       success: true
     });
@@ -806,8 +806,8 @@ app.post('/api/proxy/image-generate', authenticateSession, async (req, res) => {
   const keyData = getNextKey(req.session, 'fastrouter', 'FASTROUTER_API_KEY');
   if (!keyData) return res.status(503).json({ error: 'No FastRouter API keys available' });
 
-  // Use provided model or default to flux-schnell
-  const imageModel = model || 'black-forest-labs/flux-schnell';
+  // Use provided model or default to dall-e-3
+  const imageModel = model || 'openai/dall-e-3';
 
   try {
     const response = await fetch('https://go.fastrouter.ai/api/v1/images/generations', {
@@ -840,7 +840,14 @@ app.post('/api/proxy/image-generate', authenticateSession, async (req, res) => {
     const data = await response.json();
 
     // FastRouter returns data in OpenAI-compatible format
-    const imageUrl = data.data?.[0]?.url || data.data?.[0]?.b64_json;
+    // DALL-E 3 returns b64_json, others may return url
+    let imageUrl = data.data?.[0]?.url;
+    const b64Json = data.data?.[0]?.b64_json;
+
+    // If base64, prefix with data URI
+    if (b64Json && !imageUrl) {
+      imageUrl = `data:image/png;base64,${b64Json}`;
+    }
 
     res.json({
       success: true,
