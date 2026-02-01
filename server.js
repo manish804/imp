@@ -76,7 +76,8 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "5mb" }));
+// Base64-encoded images can exceed the raw upload size; align with 10MB frontend cap.
+app.use(express.json({ limit: "20mb" }));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -368,6 +369,24 @@ function getNextKey(session, service, baseKeyName) {
 // Helper to rotate key on failure
 function rotateKeyOnFailure(session, service) {
   session.keyIndices[service] = ((session.keyIndices[service] || 0) + 1) % 1000;
+}
+
+function parseBase64Image(image) {
+  if (typeof image !== "string") {
+    return { error: "Invalid image data" };
+  }
+
+  const match = image.match(/^data:([^;]+);base64,([\s\S]+)$/);
+  const mimeType = match?.[1] || "image/png";
+  let base64Data = match?.[2] || image;
+
+  base64Data = base64Data.replace(/\s/g, "");
+
+  if (!base64Data) {
+    return { error: "Invalid image data" };
+  }
+
+  return { mimeType, base64Data };
 }
 
 // Proxy endpoint for Groq API (with retry on rate limit)
@@ -921,18 +940,15 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
     let response;
 
     if (isEditRequest) {
-      const match =
-        typeof image === "string"
-          ? image.match(/^data:(.+);base64,(.+)$/)
-          : null;
-      const mimeType = match?.[1] || "image/png";
-      const base64Data = match?.[2] || image;
-
-      if (!base64Data || typeof base64Data !== "string") {
-        return res.status(400).json({ error: "Invalid image data" });
+      const imageData = parseBase64Image(image);
+      if (imageData.error) {
+        return res.status(400).json({ error: imageData.error });
       }
 
-      const imageBuffer = Buffer.from(base64Data, "base64");
+      const imageBuffer = Buffer.from(imageData.base64Data, "base64");
+      if (!imageBuffer.length) {
+        return res.status(400).json({ error: "Invalid image data" });
+      }
       const formData = new FormData();
       formData.append("model", imageModel);
       formData.append("prompt", prompt);
@@ -940,7 +956,7 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
       formData.append("size", "1024x1024");
       formData.append(
         "image",
-        new Blob([imageBuffer], { type: mimeType }),
+        new Blob([imageBuffer], { type: imageData.mimeType }),
         "image.png",
       );
 
