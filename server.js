@@ -6,6 +6,7 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
+import FormData from "form-data";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -956,9 +957,30 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
       formData.append("size", "1024x1024");
       formData.append(
         "image",
-        new Blob([imageBuffer], { type: imageData.mimeType }),
-        "image.png",
+        imageBuffer,
+        {
+          filename: "image.png",
+          contentType: imageData.mimeType,
+          knownLength: imageBuffer.length,
+        },
       );
+
+      let contentLength;
+      try {
+        contentLength = await new Promise((resolve, reject) => {
+          formData.getLength((err, length) => {
+            if (err) reject(err);
+            else resolve(length);
+          });
+        });
+      } catch {
+        return res.status(500).json({
+          error: "Failed to calculate image size",
+          success: false,
+        });
+      }
+
+      const formHeaders = formData.getHeaders();
 
       response = await fetch(
         "https://go.fastrouter.ai/api/v1/images/edits",
@@ -966,8 +988,11 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
           method: "POST",
           headers: {
             Authorization: `Bearer ${keyData.key}`,
+            ...formHeaders,
+            "Content-Length": String(contentLength),
           },
           body: formData,
+          duplex: "half",
         },
       );
     } else {
