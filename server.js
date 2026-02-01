@@ -7,7 +7,6 @@ import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
 import FormData from "form-data";
-import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -997,6 +996,7 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
         "Content-Length": String(contentLength),
       };
 
+      let primaryError = null;
       try {
         response = await fetch(
           "https://go.fastrouter.ai/api/v1/images/edits",
@@ -1008,31 +1008,30 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
           },
         );
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const shouldRetry =
-          message.toLowerCase().includes("duplex") ||
-          message.toLowerCase().includes("stream") ||
-          message.toLowerCase().includes("body") ||
-          message.toLowerCase().includes("content-length");
+        primaryError = error;
+      }
 
-        if (!shouldRetry) {
-          throw error;
-        }
-
+      if (!response) {
         const fallbackBody = formData.getBuffer();
-        response = await fetch(
-          "https://go.fastrouter.ai/api/v1/images/edits",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${keyData.key}`,
-              ...formHeaders,
-              "Content-Length": String(fallbackBody.length),
+        try {
+          response = await fetch(
+            "https://go.fastrouter.ai/api/v1/images/edits",
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${keyData.key}`,
+                ...formHeaders,
+                "Content-Length": String(fallbackBody.length),
+              },
+              body: fallbackBody,
             },
-            body: Readable.from(fallbackBody),
-            duplex: "half",
-          },
-        );
+          );
+        } catch (fallbackError) {
+          if (fallbackError instanceof Error) {
+            fallbackError.cause = primaryError;
+          }
+          throw fallbackError;
+        }
       }
     } else {
       response = await fetch(
@@ -1078,10 +1077,18 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
       source: "fastrouter",
     });
   } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    const cause =
+      error instanceof Error && error.cause
+        ? error.cause instanceof Error
+          ? error.cause.message
+          : String(error.cause)
+        : undefined;
     console.error("Image generation error:", error);
     res.status(500).json({
       error: "Failed to generate image",
-      details: error instanceof Error ? error.message : String(error),
+      details,
+      cause,
       success: false,
     });
   }
