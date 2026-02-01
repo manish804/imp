@@ -7,9 +7,10 @@ import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
 import FormData from "form-data";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import { Readable } from "node:stream";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -970,31 +971,69 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
         contentLength = await new Promise((resolve, reject) => {
           formData.getLength((err, length) => {
             if (err) reject(err);
-            else resolve(length);
+            else resolve(Number(length));
           });
         });
-      } catch {
+      } catch (error) {
         return res.status(500).json({
           error: "Failed to calculate image size",
+          details: error instanceof Error ? error.message : String(error),
           success: false,
         });
       }
 
       const formHeaders = formData.getHeaders();
+      if (!Number.isFinite(contentLength)) {
+        return res.status(500).json({
+          error: "Failed to calculate image size",
+          details: "Invalid content length for image payload",
+          success: false,
+        });
+      }
 
-      response = await fetch(
-        "https://go.fastrouter.ai/api/v1/images/edits",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${keyData.key}`,
-            ...formHeaders,
-            "Content-Length": String(contentLength),
+      const requestHeaders = {
+        Authorization: `Bearer ${keyData.key}`,
+        ...formHeaders,
+        "Content-Length": String(contentLength),
+      };
+
+      try {
+        response = await fetch(
+          "https://go.fastrouter.ai/api/v1/images/edits",
+          {
+            method: "POST",
+            headers: requestHeaders,
+            body: formData,
+            duplex: "half",
           },
-          body: formData,
-          duplex: "half",
-        },
-      );
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const shouldRetry =
+          message.toLowerCase().includes("duplex") ||
+          message.toLowerCase().includes("stream") ||
+          message.toLowerCase().includes("body") ||
+          message.toLowerCase().includes("content-length");
+
+        if (!shouldRetry) {
+          throw error;
+        }
+
+        const fallbackBody = formData.getBuffer();
+        response = await fetch(
+          "https://go.fastrouter.ai/api/v1/images/edits",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${keyData.key}`,
+              ...formHeaders,
+              "Content-Length": String(fallbackBody.length),
+            },
+            body: Readable.from(fallbackBody),
+            duplex: "half",
+          },
+        );
+      }
     } else {
       response = await fetch(
         "https://go.fastrouter.ai/api/v1/images/generations",
@@ -1038,8 +1077,13 @@ app.post("/api/proxy/image-generate", authenticateSession, async (req, res) => {
       model: imageModel,
       source: "fastrouter",
     });
-  } catch {
-    res.status(500).json({ error: "Failed to generate image", success: false });
+  } catch (error) {
+    console.error("Image generation error:", error);
+    res.status(500).json({
+      error: "Failed to generate image",
+      details: error instanceof Error ? error.message : String(error),
+      success: false,
+    });
   }
 });
 
