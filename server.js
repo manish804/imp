@@ -122,7 +122,6 @@ function extractKeys(baseKeyName) {
 
   const keys = new Set();
   const envVarMap = {
-    PERPLEXITY_API_KEY: "PERPLEXITY_API_KEY",
     GOOGLE_API_KEY: "GOOGLE_API_KEY",
     GROQ_API_KEY: "GROQ_API_KEY",
     OPENAI_API_KEY: "OPENAI_API_KEY",
@@ -165,7 +164,6 @@ function initializeKeyCache() {
   const services = [
     "GROQ_API_KEY",
     "GOOGLE_API_KEY",
-    "PERPLEXITY_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "GITHUB_TOKEN",
@@ -217,7 +215,6 @@ app.post("/api/session/init", (req, res) => {
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_DURATION,
     keyIndices: {
-      perplexity: 0,
       gemini: 0,
       groq: 0,
       openai: 0,
@@ -234,7 +231,6 @@ app.post("/api/session/init", (req, res) => {
   // Get actual key counts for each service
   const groqKeys = extractKeys("GROQ_API_KEY");
   const geminiKeys = extractKeys("GOOGLE_API_KEY");
-  const perplexityKeys = extractKeys("PERPLEXITY_API_KEY");
   const openaiKeys = extractKeys("OPENAI_API_KEY");
   const openrouterKeys = extractKeys("OPENROUTER_API_KEY");
   const githubKeys = extractKeys("GITHUB_TOKEN");
@@ -247,7 +243,6 @@ app.post("/api/session/init", (req, res) => {
     token,
     expiresAt: session.expiresAt,
     services: {
-      perplexity: perplexityKeys.length,
       gemini: geminiKeys.length,
       groq: groqKeys.length,
       openai: openaiKeys.length,
@@ -267,7 +262,6 @@ app.post("/api/keys/get", authenticateSession, preventCache, (req, res) => {
   if (!service) return res.status(400).json({ error: "Service not specified" });
 
   const keyMap = {
-    perplexity: "PERPLEXITY_API_KEY",
     gemini: "GOOGLE_API_KEY",
     groq: "GROQ_API_KEY",
     openai: "OPENAI_API_KEY",
@@ -321,7 +315,6 @@ app.get("/api/services/status", authenticateSession, (req, res) => {
   res.json({
     groq: extractKeys("GROQ_API_KEY").length > 0,
     gemini: extractKeys("GOOGLE_API_KEY").length > 0,
-    perplexity: extractKeys("PERPLEXITY_API_KEY").length > 0,
     openai: extractKeys("OPENAI_API_KEY").length > 0,
     openrouter: extractKeys("OPENROUTER_API_KEY").length > 0,
     github: extractKeys("GITHUB_TOKEN").length > 0,
@@ -336,7 +329,6 @@ app.get("/api/keys/count", authenticateSession, (req, res) => {
   res.json({
     groq: extractKeys("GROQ_API_KEY").length,
     gemini: extractKeys("GOOGLE_API_KEY").length,
-    perplexity: extractKeys("PERPLEXITY_API_KEY").length,
     openai: extractKeys("OPENAI_API_KEY").length,
     openrouter: extractKeys("OPENROUTER_API_KEY").length,
     github: extractKeys("GITHUB_TOKEN").length,
@@ -370,6 +362,152 @@ function getNextKey(session, service, baseKeyName) {
 // Helper to rotate key on failure
 function rotateKeyOnFailure(session, service) {
   session.keyIndices[service] = ((session.keyIndices[service] || 0) + 1) % 1000;
+}
+
+const OPENROUTER_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const OPENROUTER_DEFAULT_MODELS = [
+  "qwen/qwen3-coder:free",
+  "upstage/solar-pro-3:free",
+  "openrouter/free",
+];
+const OPENROUTER_PREFERRED_MODELS = [
+  "qwen/qwen3-coder:free",
+  "openai/gpt-oss-20b:free",
+  "openai/gpt-oss-120b:free",
+  "upstage/solar-pro-3:free",
+  "stepfun/step-3.5-flash:free",
+];
+let openRouterModelCache = { expiresAt: 0, models: OPENROUTER_DEFAULT_MODELS };
+
+function compactText(value, max = 200) {
+  if (!value) return "";
+  return String(value).replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function parseErrorMessage(rawText, fallback) {
+  if (!rawText) return fallback;
+  try {
+    const parsed = JSON.parse(rawText);
+    const message =
+      parsed?.error?.message ||
+      parsed?.message ||
+      parsed?.detail ||
+      parsed?.error_description;
+    return compactText(message, 260) || fallback;
+  } catch {
+    return compactText(rawText, 260) || fallback;
+  }
+}
+
+function isPreferredOpenRouterModel(modelId) {
+  if (typeof modelId !== "string" || !modelId.endsWith(":free")) return false;
+
+  const lower = modelId.toLowerCase();
+  if (lower.includes("vl") || lower.includes("vision")) return false;
+  if (lower.includes("image") || lower.includes("audio")) return false;
+  if (lower.includes("transcribe") || lower.includes("embedding")) return false;
+  if (lower.includes("thinking")) return false;
+  return true;
+}
+
+async function fetchOpenRouterModels(apiKey) {
+  const response = await fetch("https://openrouter.ai/api/v1/models/user", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "HTTP-Referer": primaryFrontendUrl,
+      "X-Title": "AI Chat Fusion",
+    },
+  });
+
+  if (!response.ok) {
+    const raw = await response.text();
+    const details = parseErrorMessage(
+      raw,
+      `OpenRouter model list failed (${response.status})`,
+    );
+    throw new Error(details);
+  }
+
+  const data = await response.json();
+  const available = Array.isArray(data?.data)
+    ? data.data.map((item) => item?.id).filter(isPreferredOpenRouterModel)
+    : [];
+
+  const ordered = [];
+  for (const preferred of OPENROUTER_PREFERRED_MODELS) {
+    if (available.includes(preferred)) ordered.push(preferred);
+  }
+  for (const model of available) {
+    if (!ordered.includes(model)) ordered.push(model);
+  }
+
+  const limited = ordered.slice(0, 10);
+  if (!limited.includes("openrouter/free")) limited.push("openrouter/free");
+  if (limited.length === 0) return OPENROUTER_DEFAULT_MODELS;
+
+  return limited;
+}
+
+async function getOpenRouterModels(apiKey) {
+  if (
+    openRouterModelCache.expiresAt > Date.now() &&
+    openRouterModelCache.models.length > 0
+  ) {
+    return openRouterModelCache.models;
+  }
+
+  try {
+    const models = await fetchOpenRouterModels(apiKey);
+    openRouterModelCache = {
+      expiresAt: Date.now() + OPENROUTER_MODEL_CACHE_TTL_MS,
+      models,
+    };
+    return models;
+  } catch (error) {
+    const details =
+      error instanceof Error ? error.message : "Unknown model-list error";
+    console.warn(`[OpenRouter] using fallback model list: ${details}`);
+    openRouterModelCache = {
+      expiresAt: Date.now() + OPENROUTER_MODEL_CACHE_TTL_MS,
+      models: OPENROUTER_DEFAULT_MODELS,
+    };
+    return OPENROUTER_DEFAULT_MODELS;
+  }
+}
+
+function invalidateOpenRouterModelCache() {
+  openRouterModelCache.expiresAt = 0;
+}
+
+function extractOpenRouterContent(data) {
+  const firstMessage = data?.choices?.[0]?.message;
+  const content = firstMessage?.content;
+
+  if (typeof content === "string" && content.trim()) return content.trim();
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : typeof part?.text === "string"
+            ? part.text
+            : "",
+      )
+      .join("")
+      .trim();
+    if (text) return text;
+  }
+
+  if (
+    typeof firstMessage?.reasoning === "string" &&
+    firstMessage.reasoning.trim()
+  ) {
+    return firstMessage.reasoning.trim();
+  }
+
+  return "";
 }
 
 function parseBase64Image(image) {
@@ -526,104 +664,97 @@ app.post("/api/proxy/gemini", authenticateSession, async (req, res) => {
     .json({ error: "All FastRouter API keys rate limited", success: false });
 });
 
-// Proxy endpoint for Perplexity API
-app.post("/api/proxy/perplexity", authenticateSession, async (req, res) => {
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ error: "Message required" });
-
-  const keyData = getNextKey(req.session, "perplexity", "PERPLEXITY_API_KEY");
-  if (!keyData)
-    return res.status(503).json({ error: "No Perplexity API keys available" });
-
-  try {
-    const response = await fetch("https://api.perplexity.ai/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${keyData.key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "sonar",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are Perplexity AI, a research-focused assistant with web search capabilities.",
-          },
-          { role: "user", content: message },
-        ],
-        max_tokens: 1200,
-        temperature: 0.3,
-      }),
-    });
-
-    if (!response.ok) {
-      if (response.status === 429 || response.status === 401) {
-        rotateKeyOnFailure(req.session, "perplexity");
-      }
-      return res
-        .status(response.status)
-        .json({ error: "Perplexity API error", status: response.status });
-    }
-
-    const data = await response.json();
-    res.json({
-      content: data.choices?.[0]?.message?.content || "",
-      model: "sonar",
-      source: "perplexity",
-      success: true,
-    });
-  } catch {
-    res
-      .status(500)
-      .json({ error: "Failed to call Perplexity API", success: false });
-  }
-});
-
 // Proxy endpoint for Cohere API
 app.post("/api/proxy/cohere", authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: "Message required" });
 
-  const keyData = getNextKey(req.session, "cohere", "COHERE_API_KEY");
-  if (!keyData)
-    return res.status(503).json({ error: "No Cohere API keys available" });
+  const keys = extractKeys("COHERE_API_KEY");
+  const maxRetries = Math.min(keys.length, 5);
+  const modelCandidates = [
+    "command-a-03-2025",
+    "command-r-plus-08-2024",
+    "command-r7b-12-2024",
+  ];
+  const attemptErrors = [];
 
-  try {
-    const response = await fetch("https://api.cohere.com/v2/chat", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${keyData.key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "command-a-03-2025",
-        messages: [{ role: "user", content: message }],
-        temperature: 0.7,
-      }),
-    });
-
-    if (!response.ok) {
-      if (response.status === 429 || response.status === 401) {
-        rotateKeyOnFailure(req.session, "cohere");
-      }
-      return res
-        .status(response.status)
-        .json({ error: "Cohere API error", status: response.status });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const keyData = getNextKey(req.session, "cohere", "COHERE_API_KEY");
+    if (!keyData) {
+      return res.status(503).json({ error: "No Cohere API keys available" });
     }
 
-    const data = await response.json();
-    res.json({
-      content: data.message?.content?.[0]?.text || "",
-      model: "command-a-03-2025",
-      source: "cohere",
-      success: true,
-    });
-  } catch {
-    res
-      .status(500)
-      .json({ error: "Failed to call Cohere API", success: false });
+    let shouldRotateKey = false;
+
+    for (const model of modelCandidates) {
+      try {
+        const response = await fetch("https://api.cohere.com/v2/chat", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${keyData.key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: message }],
+            temperature: 0.7,
+          }),
+        });
+
+        const raw = await response.text();
+
+        if (response.ok) {
+          const data = JSON.parse(raw);
+          const content = data?.message?.content?.[0]?.text || "";
+
+          if (!content.trim()) {
+            attemptErrors.push(`${model}: empty response`);
+            continue;
+          }
+
+          return res.json({
+            content,
+            model,
+            source: "cohere",
+            success: true,
+          });
+        }
+
+        const details = parseErrorMessage(
+          raw,
+          `Cohere API error (${response.status})`,
+        );
+        attemptErrors.push(`${model} (${response.status}): ${details}`);
+
+        if (response.status === 401 || response.status === 429) {
+          shouldRotateKey = true;
+          break;
+        }
+
+        if (
+          response.status === 404 ||
+          (response.status === 400 &&
+            /model|removed|not found|deprecated/i.test(details))
+        ) {
+          continue;
+        }
+      } catch (error) {
+        const details =
+          error instanceof Error ? error.message : "Unknown Cohere error";
+        attemptErrors.push(`${model}: ${compactText(details)}`);
+      }
+    }
+
+    if (shouldRotateKey) {
+      rotateKeyOnFailure(req.session, "cohere");
+    }
   }
+
+  return res.status(503).json({
+    error: "All Cohere models failed",
+    details: compactText(attemptErrors.join(" | "), 500),
+    success: false,
+  });
 });
 
 // Proxy endpoint for GitHub Models API
@@ -693,63 +824,88 @@ app.post("/api/proxy/openrouter", authenticateSession, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: "Message required" });
 
-  const keyData = getNextKey(req.session, "openrouter", "OPENROUTER_API_KEY");
-  if (!keyData)
-    return res.status(503).json({ error: "No OpenRouter API keys available" });
+  const keys = extractKeys("OPENROUTER_API_KEY");
+  const maxRetries = Math.min(keys.length, 5);
+  const attemptErrors = [];
 
-  const models = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-7b-instruct:free",
-  ];
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const keyData = getNextKey(req.session, "openrouter", "OPENROUTER_API_KEY");
+    if (!keyData) {
+      return res.status(503).json({ error: "No OpenRouter API keys available" });
+    }
 
-  for (const model of models) {
+    const modelCandidates = await getOpenRouterModels(keyData.key);
+
     try {
-      const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${keyData.key}`,
-            "Content-Type": "application/json",
-            // ✅ FIX: must be a single URL, not comma-separated
-            "HTTP-Referer": primaryFrontendUrl,
-            "X-Title": "AI Chat Fusion",
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              {
-                role: "system",
-                content: "You are OpenRouter AI, a flexible AI assistant.",
-              },
-              { role: "user", content: message },
-            ],
-            max_tokens: 1000,
-            temperature: 0.5,
-          }),
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${keyData.key}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": primaryFrontendUrl,
+          "X-Title": "AI Chat Fusion",
         },
-      );
+        body: JSON.stringify({
+          models: modelCandidates,
+          provider: {
+            allow_fallbacks: true,
+          },
+          messages: [
+            {
+              role: "system",
+              content: "You are OpenRouter AI, a flexible AI assistant.",
+            },
+            { role: "user", content: message },
+          ],
+          max_tokens: 1000,
+          temperature: 0.5,
+        }),
+      });
+
+      const raw = await response.text();
 
       if (response.ok) {
-        const data = await response.json();
+        const data = JSON.parse(raw);
+        const content = extractOpenRouterContent(data);
+        if (!content) {
+          attemptErrors.push("OpenRouter: empty content");
+          continue;
+        }
+
         return res.json({
-          content: data.choices?.[0]?.message?.content || "",
-          model,
+          content,
+          model: data?.model || "openrouter/free",
           source: "openrouter",
           success: true,
         });
       }
 
-      if (response.status === 429 || response.status === 401)
+      const details = parseErrorMessage(
+        raw,
+        `OpenRouter API error (${response.status})`,
+      );
+      attemptErrors.push(`${response.status}: ${details}`);
+
+      if (response.status === 401 || response.status === 429) {
         rotateKeyOnFailure(req.session, "openrouter");
-    } catch {
-      continue;
+        continue;
+      }
+
+      if (response.status === 400 || response.status === 404) {
+        invalidateOpenRouterModelCache();
+      }
+    } catch (error) {
+      const details =
+        error instanceof Error ? error.message : "Unknown OpenRouter error";
+      attemptErrors.push(`network: ${compactText(details)}`);
     }
   }
 
-  res
-    .status(503)
-    .json({ error: "All OpenRouter models failed", success: false });
+  return res.status(503).json({
+    error: "All OpenRouter attempts failed",
+    details: compactText(attemptErrors.join(" | "), 500),
+    success: false,
+  });
 });
 
 // Proxy endpoint for xAI (Grok) via FastRouter API
@@ -1106,7 +1262,6 @@ app.listen(PORT, () => {
 
   const groqKeys = extractKeys("GROQ_API_KEY");
   const geminiKeys = extractKeys("GOOGLE_API_KEY");
-  const perplexityKeys = extractKeys("PERPLEXITY_API_KEY");
   const openaiKeys = extractKeys("OPENAI_API_KEY");
   const openrouterKeys = extractKeys("OPENROUTER_API_KEY");
   const githubKeys = extractKeys("GITHUB_TOKEN");
@@ -1116,7 +1271,6 @@ app.listen(PORT, () => {
 
   console.log("- Groq:", groqKeys.length, "keys");
   console.log("- Gemini:", geminiKeys.length, "keys");
-  console.log("- Perplexity:", perplexityKeys.length, "keys");
   console.log("- OpenAI:", openaiKeys.length, "keys");
   console.log("- OpenRouter:", openrouterKeys.length, "keys");
   console.log("- GitHub:", githubKeys.length, "keys");
@@ -1127,7 +1281,6 @@ app.listen(PORT, () => {
   const totalKeys =
     groqKeys.length +
     geminiKeys.length +
-    perplexityKeys.length +
     openaiKeys.length +
     openrouterKeys.length +
     githubKeys.length +
