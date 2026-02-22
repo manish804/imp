@@ -480,6 +480,25 @@ function invalidateOpenRouterModelCache() {
   openRouterModelCache.expiresAt = 0;
 }
 
+function buildOpenRouterRequestModels(modelCandidates) {
+  const unique = Array.from(
+    new Set(
+      (Array.isArray(modelCandidates) ? modelCandidates : []).filter(
+        (model) => typeof model === "string" && model.trim().length > 0,
+      ),
+    ),
+  );
+
+  const selected = unique.slice(0, 3);
+
+  if (!selected.includes("openrouter/free")) {
+    if (selected.length < 3) selected.push("openrouter/free");
+    else selected[selected.length - 1] = "openrouter/free";
+  }
+
+  return Array.from(new Set(selected)).slice(0, 3);
+}
+
 function extractOpenRouterContent(data) {
   const firstMessage = data?.choices?.[0]?.message;
   const content = firstMessage?.content;
@@ -835,6 +854,7 @@ app.post("/api/proxy/openrouter", authenticateSession, async (req, res) => {
     }
 
     const modelCandidates = await getOpenRouterModels(keyData.key);
+    const requestModels = buildOpenRouterRequestModels(modelCandidates);
 
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -846,9 +866,10 @@ app.post("/api/proxy/openrouter", authenticateSession, async (req, res) => {
           "X-Title": "AI Chat Fusion",
         },
         body: JSON.stringify({
-          models: modelCandidates,
+          models: requestModels,
           provider: {
             allow_fallbacks: true,
+            sort: "throughput",
           },
           messages: [
             {
