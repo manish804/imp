@@ -1267,14 +1267,103 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
         raw,
         `SambaNova API error (${response.status})`,
       );
-      attemptErrors.push(`${selectedModel} (${response.status}): ${details}`);
+      let fallbackAttempted = false;
 
-      if (response.status === 400 || response.status === 404) {
-        invalidateSambaNovaModelCache();
+      if (
+        requestedModel &&
+        selectedModel === requestedModel &&
+        (response.status === 400 || response.status === 404)
+      ) {
+        const fallbackModel =
+          modelCandidates.find(
+            (modelId) =>
+              modelId !== selectedModel && isSambaNovaChatModel(modelId),
+          ) ||
+          modelCandidates.find((modelId) => modelId !== selectedModel);
+
+        if (fallbackModel) {
+          fallbackAttempted = true;
+          try {
+            const fallbackResponse = await fetch(
+              "https://api.sambanova.ai/v1/chat/completions",
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${keyData.key}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  model: fallbackModel,
+                  messages: [
+                    {
+                      role: "system",
+                      content: "You are a helpful AI assistant.",
+                    },
+                    { role: "user", content: message },
+                  ],
+                  max_tokens: 1000,
+                  temperature: 0.7,
+                }),
+              },
+            );
+
+            const fallbackRaw = await fallbackResponse.text();
+
+            if (fallbackResponse.ok) {
+              const fallbackData = JSON.parse(fallbackRaw);
+              const fallbackContent = fallbackData?.choices?.[0]?.message?.content;
+              if (fallbackContent && fallbackContent.trim()) {
+                return res.json({
+                  content: fallbackContent,
+                  model: fallbackData?.model || fallbackModel,
+                  source: "openai",
+                  success: true,
+                });
+              }
+
+              attemptErrors.push(
+                `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel}: empty response`,
+              );
+            } else {
+              const fallbackDetails = parseErrorMessage(
+                fallbackRaw,
+                `SambaNova API error (${fallbackResponse.status})`,
+              );
+              attemptErrors.push(
+                `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel} (${fallbackResponse.status}): ${fallbackDetails}`,
+              );
+
+              if (fallbackResponse.status === 400 || fallbackResponse.status === 404) {
+                invalidateSambaNovaModelCache();
+              }
+
+              if (fallbackResponse.status === 401 || fallbackResponse.status === 429) {
+                rotateKeyOnFailure(req.session, "openai");
+              }
+            }
+          } catch (fallbackError) {
+            const fallbackDetails =
+              fallbackError instanceof Error
+                ? fallbackError.message
+                : "Unknown SambaNova fallback error";
+            attemptErrors.push(
+              `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel}: ${compactText(fallbackDetails)}`,
+            );
+            rotateKeyOnFailure(req.session, "openai");
+          }
+        }
       }
 
-      if (response.status === 401 || response.status === 429) {
-        rotateKeyOnFailure(req.session, "openai");
+      if (!fallbackAttempted) {
+        attemptErrors.push(`${selectedModel} (${response.status}): ${details}`);
+
+        if (response.status === 400 || response.status === 404) {
+          invalidateSambaNovaModelCache();
+        }
+
+        if (response.status === 401 || response.status === 429) {
+          rotateKeyOnFailure(req.session, "openai");
+        }
       }
     } catch (error) {
       const details =
