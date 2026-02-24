@@ -390,6 +390,31 @@ app.get("/api/models/openai", authenticateSession, async (req, res) => {
   }
 });
 
+// List FastRouter chat models for UI dropdown selection
+app.get("/api/models/fastrouter", authenticateSession, (req, res) => {
+  const keys = extractKeys("FASTROUTER_API_KEY");
+  if (keys.length === 0) {
+    return res.status(503).json({ error: "No FastRouter API keys available" });
+  }
+
+  getFastRouterModels(keys[0])
+    .then((models) =>
+      res.json({
+        models: sanitizeModelIds(models).slice(0, FASTROUTER_MODEL_TARGET_COUNT),
+        source: "fastrouter",
+        success: true,
+      }),
+    )
+    .catch((error) => {
+      const details = error instanceof Error ? error.message : String(error);
+      res.status(500).json({
+        error: "Failed to fetch FastRouter models",
+        details: compactText(details),
+        success: false,
+      });
+    });
+});
+
 // =============================================================================
 // SECURE PROXY ENDPOINTS - AI API calls made server-side (keys never sent to client)
 // =============================================================================
@@ -429,6 +454,28 @@ let openRouterModelCache = { expiresAt: 0, models: OPENROUTER_DEFAULT_MODELS };
 const SAMBANOVA_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const SAMBANOVA_DEFAULT_MODELS = ["Meta-Llama-3.1-8B-Instruct"];
 let sambaNovaModelCache = { expiresAt: 0, models: SAMBANOVA_DEFAULT_MODELS };
+const SAMBANOVA_MODEL_PROBE_TIMEOUT_MS = 12 * 1000;
+const SAMBANOVA_MODEL_PROBE_MAX_ATTEMPTS = 2;
+const FASTROUTER_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const FASTROUTER_DEFAULT_MODELS = [
+  "anthropic/claude-sonnet-4-20250514",
+  "anthropic/claude-opus-4.5",
+  "anthropic/claude-3-5-sonnet-20241022",
+  "anthropic/claude-3-7-sonnet-20250219",
+];
+const FASTROUTER_MODEL_PREFERRED = [
+  "anthropic/claude-sonnet-4-20250514",
+  "anthropic/claude-opus-4.5",
+  "anthropic/claude-3-7-sonnet-20250219",
+  "anthropic/claude-3-5-sonnet-20241022",
+  "anthropic/claude-3-5-haiku-20241022",
+  "anthropic/claude-haiku-4.5",
+  "anthropic/claude-4.5-sonnet",
+  "anthropic/claude-opus-4-20250514",
+];
+const FASTROUTER_MODEL_TARGET_COUNT = 4;
+const FASTROUTER_MODEL_PROBE_TIMEOUT_MS = 10 * 1000;
+let fastRouterModelCache = { expiresAt: 0, models: FASTROUTER_DEFAULT_MODELS };
 
 function compactText(value, max = 200) {
   if (!value) return "";
@@ -580,6 +627,141 @@ function extractOpenRouterContent(data) {
   return "";
 }
 
+function isPreferredFastRouterModel(modelId) {
+  if (typeof modelId !== "string" || !modelId.startsWith("anthropic/")) return false;
+
+  const lower = modelId.toLowerCase();
+  if (lower.includes(":thinking")) return false;
+  if (lower.includes("image")) return false;
+  if (lower.includes("audio")) return false;
+  if (lower.includes("embedding")) return false;
+  return true;
+}
+
+async function fetchFastRouterModelCandidates(apiKey) {
+  const response = await fetch("https://go.fastrouter.ai/api/v1/models", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const raw = await response.text();
+    const details = parseErrorMessage(
+      raw,
+      `FastRouter model list failed (${response.status})`,
+    );
+    throw new Error(details);
+  }
+
+  const data = await response.json();
+  const available = sanitizeModelIds(
+    Array.isArray(data?.data) ? data.data.map((item) => item?.id) : [],
+  ).filter(isPreferredFastRouterModel);
+
+  const ordered = [];
+  for (const preferred of FASTROUTER_MODEL_PREFERRED) {
+    if (available.includes(preferred)) ordered.push(preferred);
+  }
+  for (const modelId of available) {
+    if (!ordered.includes(modelId)) ordered.push(modelId);
+  }
+
+  return ordered;
+}
+
+async function isWorkingFastRouterModel(apiKey, modelId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    FASTROUTER_MODEL_PROBE_TIMEOUT_MS,
+  );
+
+  try {
+    const response = await fetch(
+      "https://go.fastrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: "user", content: "Reply with exactly: OK" }],
+          max_tokens: 16,
+          temperature: 0,
+        }),
+        signal: controller.signal,
+      },
+    );
+
+    if (response.ok) return true;
+
+    const raw = await response.text();
+    const details = parseErrorMessage(
+      raw,
+      `FastRouter API error (${response.status})`,
+    );
+    console.warn(
+      `[FastRouter] excluding non-working model ${modelId}: ${response.status}: ${compactText(details, 320)}`,
+    );
+    return false;
+  } catch (error) {
+    const details =
+      error instanceof Error ? error.message : "Unknown FastRouter probe error";
+    console.warn(
+      `[FastRouter] excluding non-working model ${modelId}: ${compactText(details, 320)}`,
+    );
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function getFastRouterModels(apiKey) {
+  if (
+    fastRouterModelCache.expiresAt > Date.now() &&
+    fastRouterModelCache.models.length > 0
+  ) {
+    return fastRouterModelCache.models;
+  }
+
+  try {
+    const candidates = await fetchFastRouterModelCandidates(apiKey);
+    const working = [];
+
+    for (const modelId of candidates) {
+      if (working.length >= FASTROUTER_MODEL_TARGET_COUNT) break;
+      const isWorking = await isWorkingFastRouterModel(apiKey, modelId);
+      if (isWorking) working.push(modelId);
+    }
+
+    const models =
+      working.length > 0
+        ? working
+        : FASTROUTER_DEFAULT_MODELS.slice(0, FASTROUTER_MODEL_TARGET_COUNT);
+
+    fastRouterModelCache = {
+      expiresAt: Date.now() + FASTROUTER_MODEL_CACHE_TTL_MS,
+      models,
+    };
+
+    return models;
+  } catch (error) {
+    const details =
+      error instanceof Error ? error.message : "Unknown FastRouter model-list error";
+    console.warn(`[FastRouter] using fallback model list: ${details}`);
+    fastRouterModelCache = {
+      expiresAt: Date.now() + FASTROUTER_MODEL_CACHE_TTL_MS,
+      models: FASTROUTER_DEFAULT_MODELS,
+    };
+    return FASTROUTER_DEFAULT_MODELS;
+  }
+}
+
 function isSambaNovaChatModel(modelId) {
   if (typeof modelId !== "string" || !modelId.trim()) return false;
 
@@ -626,8 +808,74 @@ async function fetchSambaNovaModels(apiKey) {
     Array.isArray(data?.data) ? data.data.map((item) => item?.id) : [],
   );
 
-  if (available.length === 0) return SAMBANOVA_DEFAULT_MODELS;
-  return available;
+  const chatCandidates = available.filter((modelId) =>
+    isSambaNovaChatModel(modelId),
+  );
+  if (chatCandidates.length === 0) return SAMBANOVA_DEFAULT_MODELS;
+
+  const workingModels = [];
+
+  for (const modelId of chatCandidates) {
+    const isWorking = await isWorkingSambaNovaChatModel(apiKey, modelId);
+    if (isWorking) workingModels.push(modelId);
+  }
+
+  if (workingModels.length === 0) return SAMBANOVA_DEFAULT_MODELS;
+  return workingModels;
+}
+
+async function isWorkingSambaNovaChatModel(apiKey, modelId) {
+  let lastDetails = "";
+
+  for (
+    let attempt = 1;
+    attempt <= SAMBANOVA_MODEL_PROBE_MAX_ATTEMPTS;
+    attempt++
+  ) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      SAMBANOVA_MODEL_PROBE_TIMEOUT_MS,
+    );
+
+    try {
+      const response = await fetch("https://api.sambanova.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: "user", content: "Reply with exactly: OK" }],
+          max_tokens: 16,
+          temperature: 0,
+        }),
+        signal: controller.signal,
+      });
+
+      const raw = await response.text();
+      if (response.ok) return true;
+
+      const details = parseErrorMessage(
+        raw,
+        `SambaNova API error (${response.status})`,
+      );
+      lastDetails = `${response.status}: ${details}`;
+
+      if ([400, 401, 403, 404, 422].includes(response.status)) {
+        break;
+      }
+    } catch (error) {
+      lastDetails =
+        error instanceof Error ? error.message : "Unknown SambaNova probe error";
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  console.warn(`[SambaNova] excluding non-working model ${modelId}: ${compactText(lastDetails, 320)}`);
+  return false;
 }
 
 async function getSambaNovaModels(apiKey) {
@@ -1132,62 +1380,67 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
   const requestedModel =
     typeof model === "string" && model.trim().length > 0 ? model.trim() : null;
 
-  let fastRouterFailure = null;
   if (!requestedModel) {
     const fastRouterKeyData = getNextKey(
       req.session,
       "fastrouter",
       "FASTROUTER_API_KEY",
     );
-    if (fastRouterKeyData) {
-      try {
-        const fastRouterResponse = await fetch(
-          "https://go.fastrouter.ai/api/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${fastRouterKeyData.key}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model: "openai/gpt-4o",
-              messages: [
-                { role: "system", content: "You are a helpful AI assistant." },
-                { role: "user", content: message },
-              ],
-              max_tokens: 1000,
-              temperature: 0.7,
-            }),
+    if (!fastRouterKeyData) {
+      return res.status(503).json({
+        error: "No FastRouter API keys available for OpenAI",
+        success: false,
+      });
+    }
+
+    try {
+      const fastRouterResponse = await fetch(
+        "https://go.fastrouter.ai/api/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${fastRouterKeyData.key}`,
+            "Content-Type": "application/json",
           },
-        );
+          body: JSON.stringify({
+            model: "openai/gpt-4o",
+            messages: [
+              { role: "system", content: "You are a helpful AI assistant." },
+              { role: "user", content: message },
+            ],
+            max_tokens: 1000,
+            temperature: 0.7,
+          }),
+        },
+      );
 
-        if (fastRouterResponse.ok) {
-          const fastRouterData = await fastRouterResponse.json();
-          return res.json({
-            content: fastRouterData.choices?.[0]?.message?.content || "",
-            model: fastRouterData?.model || "openai/gpt-4o",
-            source: "openai",
-            success: true,
-          });
-        }
-
+      if (!fastRouterResponse.ok) {
         if (
           fastRouterResponse.status === 429 ||
           fastRouterResponse.status === 401
         ) {
           rotateKeyOnFailure(req.session, "fastrouter");
         }
-        fastRouterFailure = {
-          status: fastRouterResponse.status,
+
+        return res.status(fastRouterResponse.status).json({
           error: "OpenAI API error",
-        };
-      } catch {
-        fastRouterFailure = {
-          status: 500,
-          error: "Failed to call OpenAI API",
-        };
-        // Keep existing behavior and continue to SambaNova as an added path.
+          status: fastRouterResponse.status,
+          success: false,
+        });
       }
+
+      const fastRouterData = await fastRouterResponse.json();
+      return res.json({
+        content: fastRouterData.choices?.[0]?.message?.content || "",
+        model: fastRouterData?.model || "openai/gpt-4o",
+        source: "openai",
+        success: true,
+      });
+    } catch {
+      return res.status(500).json({
+        error: "Failed to call OpenAI API",
+        success: false,
+      });
     }
   }
 
@@ -1196,33 +1449,22 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
   const attemptErrors = [];
 
   if (maxRetries === 0) {
-    if (fastRouterFailure) {
-      return res
-        .status(fastRouterFailure.status)
-        .json({ error: fastRouterFailure.error, success: false });
-    }
-    return res
-      .status(503)
-      .json({
-        error:
-          "No OpenAI-compatible keys available (FastRouter/SambaNova)",
-      });
+    return res.status(503).json({
+      error: "No SambaNova API keys available",
+      success: false,
+    });
   }
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const keyData = getNextKey(req.session, "openai", "SAMBANOVAAI_API_KEY");
     if (!keyData) {
-      return res
-        .status(503)
-        .json({
-          error:
-            "No OpenAI-compatible keys available (FastRouter/SambaNova)",
-        });
+      return res.status(503).json({
+        error: "No SambaNova API keys available",
+        success: false,
+      });
     }
 
-    const modelCandidates = await getSambaNovaModels(keyData.key);
-    const selectedModel =
-      requestedModel || getPreferredSambaNovaModel(modelCandidates);
+    const selectedModel = requestedModel;
 
     try {
       const response = await fetch(
@@ -1267,103 +1509,14 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
         raw,
         `SambaNova API error (${response.status})`,
       );
-      let fallbackAttempted = false;
+      attemptErrors.push(`${selectedModel} (${response.status}): ${details}`);
 
-      if (
-        requestedModel &&
-        selectedModel === requestedModel &&
-        (response.status === 400 || response.status === 404)
-      ) {
-        const fallbackModel =
-          modelCandidates.find(
-            (modelId) =>
-              modelId !== selectedModel && isSambaNovaChatModel(modelId),
-          ) ||
-          modelCandidates.find((modelId) => modelId !== selectedModel);
-
-        if (fallbackModel) {
-          fallbackAttempted = true;
-          try {
-            const fallbackResponse = await fetch(
-              "https://api.sambanova.ai/v1/chat/completions",
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${keyData.key}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  model: fallbackModel,
-                  messages: [
-                    {
-                      role: "system",
-                      content: "You are a helpful AI assistant.",
-                    },
-                    { role: "user", content: message },
-                  ],
-                  max_tokens: 1000,
-                  temperature: 0.7,
-                }),
-              },
-            );
-
-            const fallbackRaw = await fallbackResponse.text();
-
-            if (fallbackResponse.ok) {
-              const fallbackData = JSON.parse(fallbackRaw);
-              const fallbackContent = fallbackData?.choices?.[0]?.message?.content;
-              if (fallbackContent && fallbackContent.trim()) {
-                return res.json({
-                  content: fallbackContent,
-                  model: fallbackData?.model || fallbackModel,
-                  source: "openai",
-                  success: true,
-                });
-              }
-
-              attemptErrors.push(
-                `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel}: empty response`,
-              );
-            } else {
-              const fallbackDetails = parseErrorMessage(
-                fallbackRaw,
-                `SambaNova API error (${fallbackResponse.status})`,
-              );
-              attemptErrors.push(
-                `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel} (${fallbackResponse.status}): ${fallbackDetails}`,
-              );
-
-              if (fallbackResponse.status === 400 || fallbackResponse.status === 404) {
-                invalidateSambaNovaModelCache();
-              }
-
-              if (fallbackResponse.status === 401 || fallbackResponse.status === 429) {
-                rotateKeyOnFailure(req.session, "openai");
-              }
-            }
-          } catch (fallbackError) {
-            const fallbackDetails =
-              fallbackError instanceof Error
-                ? fallbackError.message
-                : "Unknown SambaNova fallback error";
-            attemptErrors.push(
-              `${selectedModel} (${response.status}): ${details} | fallback ${fallbackModel}: ${compactText(fallbackDetails)}`,
-            );
-            rotateKeyOnFailure(req.session, "openai");
-          }
-        }
+      if (response.status === 400 || response.status === 404) {
+        invalidateSambaNovaModelCache();
       }
 
-      if (!fallbackAttempted) {
-        attemptErrors.push(`${selectedModel} (${response.status}): ${details}`);
-
-        if (response.status === 400 || response.status === 404) {
-          invalidateSambaNovaModelCache();
-        }
-
-        if (response.status === 401 || response.status === 429) {
-          rotateKeyOnFailure(req.session, "openai");
-        }
+      if (response.status === 401 || response.status === 429) {
+        rotateKeyOnFailure(req.session, "openai");
       }
     } catch (error) {
       const details =
@@ -1374,7 +1527,7 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
   }
 
   return res.status(503).json({
-    error: "All SambaNova API keys/models failed",
+    error: "SambaNova request failed for selected model",
     details: compactText(attemptErrors.join(" | "), 500),
     success: false,
   });
@@ -1382,19 +1535,27 @@ app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
 
 // Proxy endpoint for FastRouter (Anthropic Claude) API
 app.post("/api/proxy/fastrouter", authenticateSession, async (req, res) => {
-  const { message } = req.body;
+  const { message, model } = req.body;
   if (!message) return res.status(400).json({ error: "Message required" });
 
   const keyData = getNextKey(req.session, "fastrouter", "FASTROUTER_API_KEY");
   if (!keyData)
     return res.status(503).json({ error: "No FastRouter API keys available" });
 
-  const models = [
-    "anthropic/claude-3-7-sonnet-20250219",
-    "anthropic/claude-sonnet-4-20250514",
-    "anthropic/claude-opus-4.5",
-  ];
-  const selectedModel = models[Math.floor(Date.now() / 1000) % models.length];
+  const requestedModel =
+    typeof model === "string" && model.trim().length > 0 ? model.trim() : null;
+  const availableModels = await getFastRouterModels(keyData.key);
+
+  if (requestedModel && !availableModels.includes(requestedModel)) {
+    return res.status(400).json({
+      error: "Unsupported FastRouter model",
+      success: false,
+    });
+  }
+
+  const selectedModel =
+    requestedModel ||
+    availableModels[Math.floor(Date.now() / 1000) % availableModels.length];
 
   try {
     const response = await fetch(
