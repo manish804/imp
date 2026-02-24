@@ -124,7 +124,7 @@ function extractKeys(baseKeyName) {
   const envVarMap = {
     GOOGLE_API_KEY: "GOOGLE_API_KEY",
     GROQ_API_KEY: "GROQ_API_KEY",
-    OPENAI_API_KEY: "OPENAI_API_KEY",
+    SAMBANOVAAI_API_KEY: "SAMBANOVAAI_API_KEY",
     OPENROUTER_API_KEY: "OPENROUTER_API_KEY",
     GITHUB_TOKEN: "GITHUB_TOKEN",
     COHERE_API_KEY: "COHERE_API_KEY",
@@ -159,12 +159,21 @@ function extractKeys(baseKeyName) {
   return result;
 }
 
+function getOpenAICompatibleKeys() {
+  return Array.from(
+    new Set([
+      ...extractKeys("FASTROUTER_API_KEY"),
+      ...extractKeys("SAMBANOVAAI_API_KEY"),
+    ]),
+  );
+}
+
 // Pre-warm the key cache at startup
 function initializeKeyCache() {
   const services = [
     "GROQ_API_KEY",
     "GOOGLE_API_KEY",
-    "OPENAI_API_KEY",
+    "SAMBANOVAAI_API_KEY",
     "OPENROUTER_API_KEY",
     "GITHUB_TOKEN",
     "COHERE_API_KEY",
@@ -231,7 +240,7 @@ app.post("/api/session/init", (req, res) => {
   // Get actual key counts for each service
   const groqKeys = extractKeys("GROQ_API_KEY");
   const geminiKeys = extractKeys("GOOGLE_API_KEY");
-  const openaiKeys = extractKeys("OPENAI_API_KEY");
+  const openaiKeys = getOpenAICompatibleKeys();
   const openrouterKeys = extractKeys("OPENROUTER_API_KEY");
   const githubKeys = extractKeys("GITHUB_TOKEN");
   const cohereKeys = extractKeys("COHERE_API_KEY");
@@ -261,10 +270,24 @@ app.post("/api/keys/get", authenticateSession, preventCache, (req, res) => {
 
   if (!service) return res.status(400).json({ error: "Service not specified" });
 
+  if (service === "openai") {
+    const keys = getOpenAICompatibleKeys();
+    if (keys.length === 0) {
+      return res.status(404).json({ error: "No keys configured for openai" });
+    }
+
+    const currentIndex = req.session.keyIndices.openai || 0;
+    const key = keys[currentIndex % keys.length];
+
+    res.type("application/octet-stream");
+    const responseData = { key, index: currentIndex, total: keys.length };
+    const buffer = Buffer.from(JSON.stringify(responseData));
+    return res.send(buffer);
+  }
+
   const keyMap = {
     gemini: "GOOGLE_API_KEY",
     groq: "GROQ_API_KEY",
-    openai: "OPENAI_API_KEY",
     openrouter: "OPENROUTER_API_KEY",
     github: "GITHUB_TOKEN",
     cohere: "COHERE_API_KEY",
@@ -315,7 +338,7 @@ app.get("/api/services/status", authenticateSession, (req, res) => {
   res.json({
     groq: extractKeys("GROQ_API_KEY").length > 0,
     gemini: extractKeys("GOOGLE_API_KEY").length > 0,
-    openai: extractKeys("OPENAI_API_KEY").length > 0,
+    openai: getOpenAICompatibleKeys().length > 0,
     openrouter: extractKeys("OPENROUTER_API_KEY").length > 0,
     github: extractKeys("GITHUB_TOKEN").length > 0,
     cohere: extractKeys("COHERE_API_KEY").length > 0,
@@ -329,7 +352,7 @@ app.get("/api/keys/count", authenticateSession, (req, res) => {
   res.json({
     groq: extractKeys("GROQ_API_KEY").length,
     gemini: extractKeys("GOOGLE_API_KEY").length,
-    openai: extractKeys("OPENAI_API_KEY").length,
+    openai: getOpenAICompatibleKeys().length,
     openrouter: extractKeys("OPENROUTER_API_KEY").length,
     github: extractKeys("GITHUB_TOKEN").length,
     cohere: extractKeys("COHERE_API_KEY").length,
@@ -341,6 +364,30 @@ app.get("/api/keys/count", authenticateSession, (req, res) => {
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// List all available SambaNova models for UI dropdown selection
+app.get("/api/models/openai", authenticateSession, async (req, res) => {
+  const keys = extractKeys("SAMBANOVAAI_API_KEY");
+  if (keys.length === 0) {
+    return res.status(503).json({ error: "No SambaNova API keys available" });
+  }
+
+  try {
+    const models = await getSambaNovaModels(keys[0]);
+    return res.json({
+      models: sanitizeModelIds(models),
+      source: "sambanova",
+      success: true,
+    });
+  } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    return res.status(500).json({
+      error: "Failed to fetch SambaNova models",
+      details: compactText(details),
+      success: false,
+    });
+  }
 });
 
 // =============================================================================
@@ -378,6 +425,10 @@ const OPENROUTER_PREFERRED_MODELS = [
   "stepfun/step-3.5-flash:free",
 ];
 let openRouterModelCache = { expiresAt: 0, models: OPENROUTER_DEFAULT_MODELS };
+
+const SAMBANOVA_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const SAMBANOVA_DEFAULT_MODELS = ["Meta-Llama-3.1-8B-Instruct"];
+let sambaNovaModelCache = { expiresAt: 0, models: SAMBANOVA_DEFAULT_MODELS };
 
 function compactText(value, max = 200) {
   if (!value) return "";
@@ -527,6 +578,95 @@ function extractOpenRouterContent(data) {
   }
 
   return "";
+}
+
+function isSambaNovaChatModel(modelId) {
+  if (typeof modelId !== "string" || !modelId.trim()) return false;
+
+  const lower = modelId.toLowerCase();
+  if (lower.includes("embedding")) return false;
+  if (lower.includes("whisper")) return false;
+  if (lower.includes("audio")) return false;
+  if (lower.includes("transcribe")) return false;
+  if (lower.includes("tts")) return false;
+
+  return true;
+}
+
+function sanitizeModelIds(models) {
+  return Array.from(
+    new Set(
+      (Array.isArray(models) ? models : []).filter(
+        (modelId) => typeof modelId === "string" && modelId.trim().length > 0,
+      ),
+    ),
+  );
+}
+
+async function fetchSambaNovaModels(apiKey) {
+  const response = await fetch("https://api.sambanova.ai/v1/models", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const raw = await response.text();
+    const details = parseErrorMessage(
+      raw,
+      `SambaNova model list failed (${response.status})`,
+    );
+    throw new Error(details);
+  }
+
+  const data = await response.json();
+  const available = sanitizeModelIds(
+    Array.isArray(data?.data) ? data.data.map((item) => item?.id) : [],
+  );
+
+  if (available.length === 0) return SAMBANOVA_DEFAULT_MODELS;
+  return available;
+}
+
+async function getSambaNovaModels(apiKey) {
+  if (
+    sambaNovaModelCache.expiresAt > Date.now() &&
+    sambaNovaModelCache.models.length > 0
+  ) {
+    return sambaNovaModelCache.models;
+  }
+
+  try {
+    const models = await fetchSambaNovaModels(apiKey);
+    sambaNovaModelCache = {
+      expiresAt: Date.now() + SAMBANOVA_MODEL_CACHE_TTL_MS,
+      models,
+    };
+    return models;
+  } catch (error) {
+    const details =
+      error instanceof Error ? error.message : "Unknown model-list error";
+    console.warn(`[SambaNova] using fallback model list: ${details}`);
+    sambaNovaModelCache = {
+      expiresAt: Date.now() + SAMBANOVA_MODEL_CACHE_TTL_MS,
+      models: SAMBANOVA_DEFAULT_MODELS,
+    };
+    return SAMBANOVA_DEFAULT_MODELS;
+  }
+}
+
+function invalidateSambaNovaModelCache() {
+  sambaNovaModelCache.expiresAt = 0;
+}
+
+function getPreferredSambaNovaModel(models) {
+  const allModels = sanitizeModelIds(models);
+  const chatModels = allModels.filter((modelId) => isSambaNovaChatModel(modelId));
+  const candidates = chatModels.length > 0 ? chatModels : allModels;
+  if (candidates.length === 0) return SAMBANOVA_DEFAULT_MODELS[0];
+  return candidates[Math.floor(Date.now() / 1000) % candidates.length];
 }
 
 function parseBase64Image(image) {
@@ -985,58 +1125,170 @@ app.post("/api/proxy/xai", authenticateSession, async (req, res) => {
   }
 });
 
-// Proxy endpoint for OpenAI API via FastRouter
+// Proxy endpoint for OpenAI-compatible API via SambaNova
 app.post("/api/proxy/openai", authenticateSession, async (req, res) => {
-  const { message } = req.body;
+  const { message, model } = req.body;
   if (!message) return res.status(400).json({ error: "Message required" });
+  const requestedModel =
+    typeof model === "string" && model.trim().length > 0 ? model.trim() : null;
 
-  const keyData = getNextKey(req.session, "fastrouter", "FASTROUTER_API_KEY");
-  if (!keyData)
+  let fastRouterFailure = null;
+  if (!requestedModel) {
+    const fastRouterKeyData = getNextKey(
+      req.session,
+      "fastrouter",
+      "FASTROUTER_API_KEY",
+    );
+    if (fastRouterKeyData) {
+      try {
+        const fastRouterResponse = await fetch(
+          "https://go.fastrouter.ai/api/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${fastRouterKeyData.key}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model: "openai/gpt-4o",
+              messages: [
+                { role: "system", content: "You are a helpful AI assistant." },
+                { role: "user", content: message },
+              ],
+              max_tokens: 1000,
+              temperature: 0.7,
+            }),
+          },
+        );
+
+        if (fastRouterResponse.ok) {
+          const fastRouterData = await fastRouterResponse.json();
+          return res.json({
+            content: fastRouterData.choices?.[0]?.message?.content || "",
+            model: fastRouterData?.model || "openai/gpt-4o",
+            source: "openai",
+            success: true,
+          });
+        }
+
+        if (
+          fastRouterResponse.status === 429 ||
+          fastRouterResponse.status === 401
+        ) {
+          rotateKeyOnFailure(req.session, "fastrouter");
+        }
+        fastRouterFailure = {
+          status: fastRouterResponse.status,
+          error: "OpenAI API error",
+        };
+      } catch {
+        fastRouterFailure = {
+          status: 500,
+          error: "Failed to call OpenAI API",
+        };
+        // Keep existing behavior and continue to SambaNova as an added path.
+      }
+    }
+  }
+
+  const keys = extractKeys("SAMBANOVAAI_API_KEY");
+  const maxRetries = Math.min(keys.length, 5);
+  const attemptErrors = [];
+
+  if (maxRetries === 0) {
+    if (fastRouterFailure) {
+      return res
+        .status(fastRouterFailure.status)
+        .json({ error: fastRouterFailure.error, success: false });
+    }
     return res
       .status(503)
-      .json({ error: "No FastRouter API keys available for OpenAI" });
+      .json({
+        error:
+          "No OpenAI-compatible keys available (FastRouter/SambaNova)",
+      });
+  }
 
-  try {
-    const response = await fetch(
-      "https://go.fastrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${keyData.key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-4o",
-          messages: [
-            { role: "system", content: "You are a helpful AI assistant." },
-            { role: "user", content: message },
-          ],
-          max_tokens: 1000,
-          temperature: 0.7,
-        }),
-      },
-    );
-
-    if (!response.ok) {
-      if (response.status === 429 || response.status === 401)
-        rotateKeyOnFailure(req.session, "fastrouter");
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const keyData = getNextKey(req.session, "openai", "SAMBANOVAAI_API_KEY");
+    if (!keyData) {
       return res
-        .status(response.status)
-        .json({ error: "OpenAI API error", status: response.status });
+        .status(503)
+        .json({
+          error:
+            "No OpenAI-compatible keys available (FastRouter/SambaNova)",
+        });
     }
 
-    const data = await response.json();
-    res.json({
-      content: data.choices?.[0]?.message?.content || "",
-      model: "openai/gpt-4o",
-      source: "openai",
-      success: true,
-    });
-  } catch {
-    res
-      .status(500)
-      .json({ error: "Failed to call OpenAI API", success: false });
+    const modelCandidates = await getSambaNovaModels(keyData.key);
+    const selectedModel =
+      requestedModel || getPreferredSambaNovaModel(modelCandidates);
+
+    try {
+      const response = await fetch(
+        "https://api.sambanova.ai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${keyData.key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: selectedModel,
+            messages: [
+              { role: "system", content: "You are a helpful AI assistant." },
+              { role: "user", content: message },
+            ],
+            max_tokens: 1000,
+            temperature: 0.7,
+          }),
+        },
+      );
+
+      const raw = await response.text();
+
+      if (response.ok) {
+        const data = JSON.parse(raw);
+        const content = data?.choices?.[0]?.message?.content;
+        if (!content || !content.trim()) {
+          attemptErrors.push(`${selectedModel}: empty response`);
+          continue;
+        }
+
+        return res.json({
+          content,
+          model: data?.model || selectedModel,
+          source: "openai",
+          success: true,
+        });
+      }
+
+      const details = parseErrorMessage(
+        raw,
+        `SambaNova API error (${response.status})`,
+      );
+      attemptErrors.push(`${selectedModel} (${response.status}): ${details}`);
+
+      if (response.status === 400 || response.status === 404) {
+        invalidateSambaNovaModelCache();
+      }
+
+      if (response.status === 401 || response.status === 429) {
+        rotateKeyOnFailure(req.session, "openai");
+      }
+    } catch (error) {
+      const details =
+        error instanceof Error ? error.message : "Unknown SambaNova error";
+      attemptErrors.push(`${selectedModel}: ${compactText(details)}`);
+      rotateKeyOnFailure(req.session, "openai");
+    }
   }
+
+  return res.status(503).json({
+    error: "All SambaNova API keys/models failed",
+    details: compactText(attemptErrors.join(" | "), 500),
+    success: false,
+  });
 });
 
 // Proxy endpoint for FastRouter (Anthropic Claude) API
@@ -1283,7 +1535,7 @@ app.listen(PORT, () => {
 
   const groqKeys = extractKeys("GROQ_API_KEY");
   const geminiKeys = extractKeys("GOOGLE_API_KEY");
-  const openaiKeys = extractKeys("OPENAI_API_KEY");
+  const openaiKeys = getOpenAICompatibleKeys();
   const openrouterKeys = extractKeys("OPENROUTER_API_KEY");
   const githubKeys = extractKeys("GITHUB_TOKEN");
   const cohereKeys = extractKeys("COHERE_API_KEY");
